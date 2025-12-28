@@ -1,0 +1,11 @@
+---
+prompt_file: prompts/qampari_default.json
+eval_file: data/qampari_eval_gtr_top100_reranked_oracle.json
+shot: 2
+ndoc: 5
+dataset_name: qampari
+tag: oracle
+model: gpt-5-2025-08-07
+openai_api: true
+max_length: 10240
+max_new_tokens: 4096
