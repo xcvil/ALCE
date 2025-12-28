@@ -176,3 +176,94 @@ Please cite our paper if you use ALCE in your work:
    booktitle={Empirical Methods in Natural Language Processing (EMNLP)},
 }
 ```
+
+# Notes
+
+## Portkey-ai sample response
+
+```json
+{
+    "id": "chatcmpl-Cro0J4hiwS8FrQ2gqUxLdxjf3H5x9",
+    "choices": [
+        {
+            "finish_reason": "content_filter",
+            "index": 0,
+            "logprobs": null,
+            "message": {
+                "content": null,
+                "role": "assistant",
+                "function_call": null,
+                "tool_calls": null,
+                "refusal": null,
+                "audio": null,
+                "annotations": []
+            },
+            "content_filter_results": {
+                "hate": {
+                    "filtered": false,
+                    "severity": "safe"
+                },
+                "self_harm": {
+                    "filtered": false,
+                    "severity": "safe"
+                },
+                "sexual": {
+                    "filtered": true,
+                    "severity": "medium"
+                },
+                "violence": {
+                    "filtered": false,
+                    "severity": "safe"
+                }
+            }
+        }
+    ],
+    "created": 1766939635,
+    "model": "gpt-5-2025-08-07",
+    "object": "chat.completion",
+    "system_fingerprint": null,
+    "usage": {
+        "prompt_tokens": 2505,
+        "completion_tokens": 1232,
+        "total_tokens": 3737,
+        "completion_tokens_details": {
+            "accepted_prediction_tokens": 0,
+            "audio_tokens": 0,
+            "reasoning_tokens": 1216,
+            "rejected_prediction_tokens": 0
+        },
+        "prompt_tokens_details": {
+            "audio_tokens": 0,
+            "cached_tokens": 1920
+        }
+    },
+    "service_tier": null,
+    "prompt_filter_results": [
+        {
+            "prompt_index": 0,
+            "content_filter_results": {
+                "hate": {
+                    "filtered": false,
+                    "severity": "safe"
+                },
+                "jailbreak": {
+                    "filtered": false,
+                    "detected": false
+                },
+                "self_harm": {
+                    "filtered": false,
+                    "severity": "safe"
+                },
+                "sexual": {
+                    "filtered": false,
+                    "severity": "safe"
+                },
+                "violence": {
+                    "filtered": false,
+                    "severity": "safe"
+                }
+            }
+        }
+    ]
+}
+```

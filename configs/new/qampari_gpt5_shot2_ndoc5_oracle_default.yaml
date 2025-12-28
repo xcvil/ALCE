@@ -8,4 +8,4 @@ tag: oracle
 model: gpt-5-2025-08-07
 openai_api: true
 max_length: 10240
-max_new_tokens: 4096
+max_new_tokens: 6000
