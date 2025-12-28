@@ -5,10 +5,9 @@ logger.setLevel(logging.INFO)
 
 import argparse
 import os
-import openai
+import sys
 import json
 from tqdm import tqdm
-from transformers import AutoTokenizer
 import time
 import string
 import numpy as np
@@ -17,6 +16,126 @@ from searcher import SearcherWithinDocs
 import yaml
 from utils import *
 from nltk import sent_tokenize
+from dotenv import load_dotenv
+
+def _env_to_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    v = str(value).strip().lower()
+    return v in {"1", "true", "t", "yes", "y", "on"}
+
+
+def _maybe_get(obj, key, default=None):
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _extract_chat_completion_text(response):
+    """
+    Extract assistant text from Portkey/OpenAI-style chat completion responses.
+    Returns "" if unavailable.
+    """
+    choices = _maybe_get(response, "choices", None)
+    if not choices:
+        return ""
+    first = choices[0]
+    message = _maybe_get(first, "message", None)
+    if message is not None:
+        content = _maybe_get(message, "content", None)
+        if content is not None:
+            return content
+    # Fallback for non-chat-like shapes
+    text = _maybe_get(first, "text", None)
+    return text if text is not None else ""
+
+
+def _extract_finish_reason(response):
+    """Extract finish_reason from a Portkey/OpenAI-style chat completion response."""
+    choices = _maybe_get(response, "choices", None)
+    if not choices:
+        return None
+    first = choices[0]
+    return _maybe_get(first, "finish_reason", None)
+
+
+def _sum_numeric_values(obj):
+    """
+    Sum all numeric (int/float) values in a dict-like object; ignores bools and nested structures.
+    Returns 0 for None / unknown shapes.
+    """
+    if obj is None:
+        return 0
+    if isinstance(obj, dict):
+        values = obj.values()
+    else:
+        # Try common object-to-dict patterns (pydantic / dataclasses / simple objects)
+        to_dict = getattr(obj, "dict", None)
+        if callable(to_dict):
+            try:
+                obj = to_dict()
+            except Exception:
+                obj = {}
+        elif hasattr(obj, "__dict__"):
+            obj = obj.__dict__
+        else:
+            obj = {}
+        values = obj.values() if isinstance(obj, dict) else []
+
+    total = 0
+    for v in values:
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, (int, float)):
+            total += v
+    return total
+
+
+def _extract_usage_total_reasoning_and_answer_tokens(response):
+    """
+    Extract:
+      - `usage.total_tokens`
+      - `usage.completion_tokens_details.reasoning_tokens`
+      - `answer_tokens = usage.completion_tokens - sum(usage.completion_tokens_details values)`
+
+    Returns (total_tokens, reasoning_tokens, answer_tokens) where each may be None if unavailable.
+    """
+    usage = _maybe_get(response, "usage", None)
+    total_tokens = _maybe_get(usage, "total_tokens", None)
+    completion_tokens = _maybe_get(usage, "completion_tokens", None)
+    completion_details = _maybe_get(usage, "completion_tokens_details", None)
+    reasoning_tokens = _maybe_get(completion_details, "reasoning_tokens", None)
+    answer_tokens = None
+    if completion_tokens is not None:
+        answer_tokens = completion_tokens - _sum_numeric_values(completion_details)
+    return total_tokens, reasoning_tokens, answer_tokens
+
+
+class _TiktokenTokenizer:
+    """
+    Small wrapper to provide a `.tokenize(text)` API compatible with how this script
+    computes prompt lengths, backed by OpenAI's `tiktoken`.
+    """
+
+    def __init__(self, model: str):
+        import tiktoken
+
+        try:
+            self._enc = tiktoken.encoding_for_model(model)
+            logger.info(f"Using Tiktoken model: {model}")
+        except KeyError:
+            # Fallback encoding (works well for modern OpenAI-family models)
+            self._enc = tiktoken.get_encoding("o200k_base")
+            logger.warning(f"Using Tiktoken model: o200k_base")
+
+    def tokenize(self, text: str):
+        # Allow special tokens if present in the text; we only need a length estimate.
+        return self._enc.encode(text, disallowed_special=())
+
 
 def remove_citations(sent):
     return re.sub(r"\[\d+", "", re.sub(r" \[\d+", "", sent)).replace(" |", "").replace("]", "")
@@ -27,30 +146,59 @@ class LLM:
         self.args = args
 
         if args.openai_api:
-            import openai 
-            OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-            OPENAI_ORG_ID = os.environ.get("OPENAI_ORG_ID")
-            OPENAI_API_BASE = os.environ.get("OPENAI_API_BASE")
+            # Load env (safe if already loaded in main())
+            load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"), override=False)
 
-            if args.azure:
-                openai.api_key = OPENAI_API_KEY
-                openai.api_base = OPENAI_API_BASE
-                openai.api_type = 'azure'
-                openai.api_version = '2023-05-15' 
-            else: 
-                openai.api_key = OPENAI_API_KEY
-                openai.organization = OPENAI_ORG_ID
+            from portkey_ai import Portkey
 
-            self.tokenizer = AutoTokenizer.from_pretrained("gpt2", fast_tokenizer=False) # TODO: For ChatGPT we should use a different one
-            # To keep track of how much the API costs
-            self.prompt_tokens = 0
-            self.completion_tokens = 0
+            self.portkey_api_key = os.environ.get("PORTKEY_API_KEY")
+            self.portkey_base_url = os.environ.get("PORTKEY_BASE_URL")
+            self.portkey_provider = os.environ.get("PORTKEY_PROVIDER")
+            self.portkey_debug = _env_to_bool(os.environ.get("PORTKEY_DEBUG"), default=False)
+
+            if not self.portkey_api_key:
+                raise ValueError(
+                    "Missing `PORTKEY_API_KEY`. Set it in your environment or in a `.env` file.\n"
+                    "Example:\n"
+                    "  PORTKEY_API_KEY=...\n"
+                    "  PORTKEY_BASE_URL=https://.../v1\n"
+                    "  PORTKEY_PROVIDER=azure-openai\n"
+                    "  MODEL=gpt-5-2025-08-07\n"
+                )
+
+            # `args.model` should be resolved before constructing LLM, but keep a fallback.
+            self.model = args.model or os.environ.get("MODEL")
+            if not self.model:
+                raise ValueError(
+                    "Missing model name. Provide `--model ...` or set `MODEL=...` in your environment / `.env`."
+                )
+
+            portkey_kwargs = {"api_key": self.portkey_api_key}
+            if self.portkey_base_url:
+                portkey_kwargs["base_url"] = self.portkey_base_url
+            if self.portkey_provider:
+                portkey_kwargs["provider"] = self.portkey_provider
+            # Some SDK versions may not support `debug`; pass it defensively.
+            try:
+                self.portkey = Portkey(debug=self.portkey_debug, strict_open_ai_compliance=False, **portkey_kwargs)
+            except TypeError:
+                self.portkey = Portkey(strict_open_ai_compliance=False, **portkey_kwargs)
+
+            # Token counting for prompt-length budgeting in API mode
+            self.tokenizer = _TiktokenTokenizer(self.model)
         else:
             self.model, self.tokenizer = load_model(args.model)
         
         self.prompt_exceed_max_length = 0
         self.fewer_than_50 = 0
-        self.azure_filter_fail = 0
+        self.finish_reason_length = 0
+        self.finish_reason_content_filter = 0
+        self.total_tokens_sum = 0
+        self.total_tokens_count = 0
+        self.reasoning_tokens_sum = 0
+        self.reasoning_tokens_count = 0
+        self.answer_tokens_sum = 0
+        self.answer_tokens_count = 0
 
 
     def generate(self, prompt, max_tokens, stop=None):
@@ -64,70 +212,75 @@ class LLM:
             logger.warning("The model can at most generate < 50 tokens. If this happens too many times, it is suggested to make the prompt shorter")
 
         if args.openai_api:
-            use_chat_api = ("turbo" in args.model and not args.azure) or ("gpt-4" in args.model and args.azure)
-            if use_chat_api:
-                # For chat API, we need to convert text prompts to chat prompts
-                prompt = [
-                    {'role': 'system', 'content': "You are a helpful assistant that answers the following questions with proper citations."},
-                    {'role': 'user', 'content': prompt}
-                ]
-            if args.azure:
-                deploy_name = args.model
+            messages = [
+                {'role': 'system', 'content': "You are a helpful assistant that answers the following questions with proper citations."},
+                {'role': 'user', 'content': prompt}
+            ]
 
-            if use_chat_api:
-                is_ok = False
-                retry_count = 0
-                while not is_ok:
-                    retry_count += 1
-                    try:
-                        response = openai.ChatCompletion.create(
-                            engine=deploy_name if args.azure else None,
-                            model=args.model,
-                            messages=prompt,
-                            temperature=args.temperature,
-                            max_tokens=max_tokens,
-                            stop=stop,
-                            top_p=args.top_p,
-                        )
-                        is_ok = True
-                    except Exception as error:
-                        if retry_count <= 5:
-                            logger.warning(f"OpenAI API retry for {retry_count} times ({error})")
-                            continue
-                        print(error)
-                        import pdb; pdb.set_trace()
-                self.prompt_tokens += response['usage']['prompt_tokens']
-                self.completion_tokens += response['usage']['completion_tokens']
-                return response['choices'][0]['message']['content']
-            else:
-                is_ok = False
-                retry_count = 0
-                while not is_ok:
-                    retry_count += 1
-                    try:
-                        response = openai.Completion.create(
-                            engine=deploy_name if args.azure else None,
-                            model=args.model,
-                            prompt=prompt,
-                            temperature=args.temperature,
-                            max_tokens=max_tokens,
-                            top_p=args.top_p,
-                            stop=["\n", "\n\n"] + (stop if stop is not None else [])
-                        )    
-                        is_ok = True
-                    except Exception as error:
-                        if retry_count <= 5:
-                            logger.warning(f"OpenAI API retry for {retry_count} times ({error})")
-                            if "triggering Azure OpenAI’s content management policy" in str(error):
-                                # filtered by Azure 
-                                self.azure_filter_fail += 1
-                                return ""
-                            continue
-                        print(error)
-                        import pdb; pdb.set_trace()
-                self.prompt_tokens += response['usage']['prompt_tokens']
-                self.completion_tokens += response['usage']['completion_tokens']
-                return response['choices'][0]['text']
+            is_ok = False
+            retry_count = 0
+            last_error = None
+            while not is_ok:
+                retry_count += 1
+                try:
+                    model_id = (self.model or "").strip().lower()
+
+                    # Hard rules for model parameter support:
+                    # - Some model families (e.g., gpt-5 / o1 / o3) use `max_completion_tokens` (not `max_tokens`)
+                    # - Some model families reject decoding knobs like `temperature` / `top_p`
+                    uses_max_completion_tokens = (
+                        model_id.startswith("gpt-5")
+                        or model_id.startswith("o1")
+                        or model_id.startswith("o3")
+                    )
+                    supports_temperature = not (
+                        model_id.startswith("gpt-5")
+                        or model_id.startswith("o1")
+                        or model_id.startswith("o3")
+                    )
+
+                    request_kwargs = {
+                        "model": self.model,
+                        "messages": messages,
+                        ("max_completion_tokens" if uses_max_completion_tokens else "max_tokens"): max_tokens,
+                    }
+                    if stop is not None:
+                        request_kwargs["stop"] = stop
+                    if supports_temperature:
+                        request_kwargs["temperature"] = args.temperature
+                        request_kwargs["top_p"] = args.top_p
+
+                    response = self.portkey.chat.completions.create(**request_kwargs)
+
+                    total_tokens, reasoning_tokens, answer_tokens = _extract_usage_total_reasoning_and_answer_tokens(response)
+                    if total_tokens is not None:
+                        self.total_tokens_sum += total_tokens
+                        self.total_tokens_count += 1
+                    if reasoning_tokens is not None:
+                        self.reasoning_tokens_sum += reasoning_tokens
+                        self.reasoning_tokens_count += 1
+                    if answer_tokens is not None:
+                        self.answer_tokens_sum += answer_tokens
+                        self.answer_tokens_count += 1
+
+                    finish_reason = _extract_finish_reason(response)
+                    if finish_reason == "length":
+                        self.finish_reason_length += 1
+                        logger.warning("Portkey finish_reason=length (output likely truncated by token limit).")
+                    elif finish_reason == "content_filter":
+                        self.finish_reason_content_filter += 1
+                        logger.warning("Portkey finish_reason=content_filter (output filtered).")
+
+                    is_ok = True
+                except Exception as error:
+                    last_error = error
+                    if retry_count <= 5:
+                        logger.warning(f"Portkey API retry for {retry_count} times ({error})")
+                        time.sleep(1.0)
+                        continue
+                    raise last_error
+
+            return _extract_chat_completion_text(response)
         else:
             inputs = self.tokenizer([prompt], return_tensors="pt").to(self.model.device)
             stop = [] if stop is None else stop
@@ -147,6 +300,9 @@ class LLM:
 
 
 def main():
+    # Load `.env` from the repo root so users can configure Portkey without exporting env vars.
+    load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"), override=False)
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=None, help="Path to the config file")
 
@@ -217,8 +373,26 @@ def main():
     config = yaml.safe_load(open(args.config)) if args.config is not None else {}
     parser.set_defaults(**config)
     args = parser.parse_args()
+
+    # Allow `.env` to provide a default model name.
+    model_from_env = False
+    if not getattr(args, "model", None):
+        env_model = os.environ.get("MODEL")
+        if env_model:
+            args.model = env_model
+            model_from_env = True
+
+    # Portkey auto-enable: if PORTKEY_API_KEY is present, default to API mode unless user explicitly set --openai_api.
+    openai_api_explicit = any(arg.startswith("--openai_api") for arg in sys.argv[1:])
+    if (not getattr(args, "openai_api", False)) and (not openai_api_explicit) and os.environ.get("PORTKEY_API_KEY"):
+        logger.info("Detected PORTKEY_API_KEY in environment; enabling API mode via Portkey.")
+        args.openai_api = True
+
     for k in args.__dict__:
         print(f"{k}: {args.__dict__[k]}")
+
+    if not args.model:
+        raise ValueError("Missing model name. Provide `--model ...` or set `MODEL=...` in `.env` / environment.")
 
     if "turbo" in args.model:
         # ChatGPT has a longer max length
@@ -301,8 +475,13 @@ def main():
         prompt_len = len(llm.tokenizer.tokenize(prompt))
 
         if idx == 0:
+            print("--------------------------------")
+            print("Prompt:")
             print(prompt)
-
+            print("--------------------------------")
+            print("Prompt length:")
+            print(prompt_len)
+            print("--------------------------------")
         output_array = []
         for _ in range(args.num_samples):
             if args.interactive:
@@ -400,12 +579,37 @@ def main():
             logger.info(f"Prompt length={prompt_len}")
             logger.info(f"Question: {item['question']}")
             logger.info(f"Gold answer: {item['answer']}")
-            logger.info(f"Final model output: {output_array[-1]}") 
+            logger.info(f"Final model output: {output_array[-1]}")
+
+            if args.openai_api and llm.total_tokens_count > 0:
+                avg_total = llm.total_tokens_sum / llm.total_tokens_count
+                avg_reasoning = llm.reasoning_tokens_sum / llm.reasoning_tokens_count if llm.reasoning_tokens_count > 0 else 0
+                avg_answer = llm.answer_tokens_sum / llm.answer_tokens_count if llm.answer_tokens_count > 0 else 0
+                logger.info(
+                    f"Usage avg so far: total_tokens={avg_total:.1f} (n={llm.total_tokens_count}), "
+                    f"reasoning_tokens={avg_reasoning:.1f} (n={llm.reasoning_tokens_count}), "
+                    f"answer_tokens={avg_answer:.1f} (n={llm.answer_tokens_count})"
+                )
         
         item['output'] = output_array if len(output_array) > 1 else output_array[0]
         
     logger.info(f"#Cases when prompts exceed max length: {llm.prompt_exceed_max_length}")
     logger.info(f"#Cases when max new tokens < 50: {llm.fewer_than_50}")
+    if args.openai_api:
+        logger.warning(
+            f"#Portkey finish_reason counters: "
+            f"length={llm.finish_reason_length}, content_filter={llm.finish_reason_content_filter}"
+        )
+        if llm.total_tokens_count > 0:
+            avg_total = llm.total_tokens_sum / llm.total_tokens_count
+            avg_reasoning = llm.reasoning_tokens_sum / llm.reasoning_tokens_count if llm.reasoning_tokens_count > 0 else 0
+            avg_answer = llm.answer_tokens_sum / llm.answer_tokens_count if llm.answer_tokens_count > 0 else 0
+            logger.warning(
+                f"#Portkey usage averages: "
+                f"total_tokens={avg_total:.1f} (n={llm.total_tokens_count}), "
+                f"reasoning_tokens={avg_reasoning:.1f} (n={llm.reasoning_tokens_count}), "
+                f"answer_tokens={avg_answer:.1f} (n={llm.answer_tokens_count})"
+            )
 
     # Save the result
     model_name = args.model
@@ -430,27 +634,6 @@ def main():
         "args": args.__dict__,
         "data": eval_data,
     }
-    if args.openai_api:
-        logger.info(f"Token used: prompt {llm.prompt_tokens}; completion {llm.completion_tokens}")
-        if "turbo" in args.model:
-            p_price, c_price = 0.0015, 0.002
-            if "16k" in args.model:
-                p_price, c_price = 0.003, 0.004
-        elif "gpt4" in args.model or "gpt-4" in args.model:
-            p_price, c_price = 0.03, 0.06
-            if "32k" in args.model:
-                p_price, c_price = 0.06, 0.12
-        else:
-            logger.warn("Cannot find model price")
-            p_price, c_price = 0, 0
-
-        eval_data["total_cost"] = llm.prompt_tokens / 1000 * p_price + llm.completion_tokens / 1000 * c_price        
-
-        logger.info(f"Unit price (Oct 16, 2023, prompt/completion): {p_price}/{c_price}")
-        logger.info(f"Total cost: %.1f" % (eval_data["total_cost"]))
-
-        if args.azure:
-            eval_data["azure_filter_fail"] = llm.azure_filter_fail 
 
     if not os.path.exists("result"):
         os.makedirs("result")
