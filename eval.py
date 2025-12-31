@@ -1,6 +1,7 @@
 import argparse
 import collections
 import json
+import os
 import re
 import string
 import torch
@@ -155,6 +156,29 @@ def compute_rouge(data):
     return scores['rougeLsum']
 
 
+def compute_rouge_per_item(data):
+    """
+    Compute per-item ROUGE-Lsum f-measure (0-100), selecting the better of two references if provided.
+    Note: this differs from `compute_rouge()` which uses BootstrapAggregator for corpus-level scoring.
+    """
+    scorer = rouge_scorer.RougeScorer(["rougeLsum"], use_stemmer=True)
+    per_item = []
+    for item in data:
+        hypothesis = '\n'.join(sent_tokenize(item.get("output", "").lower()))
+        if "annotations" in item and item["annotations"] is not None:
+            ref1 = item["annotations"][0]["long_answer"]
+            ref2 = item["annotations"][1]["long_answer"]
+        else:
+            ref1 = item.get("answer", "")
+            ref2 = item.get("answer", "")
+        ref1 = '\n'.join(sent_tokenize(str(ref1).lower()))
+        ref2 = '\n'.join(sent_tokenize(str(ref2).lower()))
+        score1 = scorer.score(ref1, hypothesis)["rougeLsum"].fmeasure
+        score2 = scorer.score(ref2, hypothesis)["rougeLsum"].fmeasure
+        per_item.append(100 * (score1 if score1 > score2 else score2))
+    return per_item
+
+
 def compute_str_em(data):
     """Compute STR-EM metric (only for ASQA)
     Args:
@@ -179,6 +203,20 @@ def compute_str_em(data):
     return 100 * np.mean(acc), 100 * np.mean(hit)
 
 
+def compute_str_em_per_item(data):
+    """Compute per-item STR-EM/STR-HIT (0-100)."""
+    per_item = []
+    for item in data:
+        qa_pairs = item.get("qa_pairs", None)
+        if not qa_pairs:
+            per_item.append({"str_em": 0.0, "str_hit": 0.0})
+            continue
+        loc_acc = [exact_presence(qa_pair["short_answers"], item.get("output", "")) for qa_pair in qa_pairs]
+        score = float(np.mean(loc_acc)) if len(loc_acc) > 0 else 0.0
+        per_item.append({"str_em": 100 * score, "str_hit": 100 * float(score == 1.0)})
+    return per_item
+
+
 def compute_len(data):
     """Compute average length of predictions."""
 
@@ -189,7 +227,7 @@ def compute_len(data):
     return res / cntr
 
 
-def compute_qa(data):
+def compute_qa(data, return_per_item=False):
     """Compute QA-based accuracy.
     Args:
         data: requires filed `qa_pairs/short_answers` and `output`
@@ -199,11 +237,15 @@ def compute_qa(data):
 
     if 'qa_pairs' not in data[0] or data[0]['qa_pairs'] is None:
         logger.warn("Warning: no QA pairs found in data")
-        return {
+        empty = {
             'QA-EM': 0,
             'QA-F1': 0,
             'QA-Hit': 0,
         }
+        if return_per_item:
+            per_item = [{"QA-EM": 0.0, "QA-F1": 0.0, "QA-Hit": 0.0} for _ in range(len(data))]
+            return empty, per_item
+        return empty
 
     # Load model
     logger.info("Loading the RoBERTa-large SQuAD model for QA-based accuracy...")
@@ -213,6 +255,7 @@ def compute_qa(data):
     # Get prediction
     logger.info("Computing the QA-based accuracy...")
     em, f1, bins = [], [], []
+    per_item = []
     for item in tqdm(data):
         question = [qa_pair['question'] for qa_pair in item['qa_pairs']]
         context = item['output'] if len(item['output']) > 0 else " "
@@ -227,15 +270,23 @@ def compute_qa(data):
             loc_f1 += max([compute_f1(a, prediction) for a in answers])
             loc_counter += 1
 
-        em.append(loc_em / loc_counter)
-        f1.append(loc_f1 / loc_counter)
-        bins.append(loc_em == loc_counter)
+        item_em = loc_em / loc_counter if loc_counter > 0 else 0
+        item_f1 = loc_f1 / loc_counter if loc_counter > 0 else 0
+        item_hit = int(loc_em == loc_counter) if loc_counter > 0 else 0
+        em.append(item_em)
+        f1.append(item_f1)
+        bins.append(item_hit)
+        if return_per_item:
+            per_item.append({"QA-EM": 100 * item_em, "QA-F1": 100 * item_f1, "QA-Hit": 100 * item_hit})
 
-    return {
+    agg = {
         'QA-EM': 100 * np.mean(em),
         'QA-F1': 100 * np.mean(f1),
         'QA-Hit': 100 * np.mean(bins)
     }
+    if return_per_item:
+        return agg, per_item
+    return agg
 
 
 def compute_mauve(data):
@@ -279,7 +330,7 @@ def _run_nli_autoais(passage, claim):
     return inference
 
 
-def compute_claims(data):
+def compute_claims(data, return_per_item=False):
     global autoais_model, autoais_tokenizer
     if autoais_model is None:
         logger.info("Loading AutoAIS model...")
@@ -288,21 +339,29 @@ def compute_claims(data):
 
     logger.info("Computing claims...")
     scores = []
+    per_item = []
     for item in tqdm(data):
         normalized_output = remove_citations(item['output'])
         entail = 0
-        claims = item["claims"]
+        claims = item.get("claims", None) or []
         for claim in claims:
             entail += _run_nli_autoais(normalized_output, claim)
-        scores.append(entail / len(claims))
-    return 100 * np.mean(scores)
+        item_score = entail / len(claims) if len(claims) > 0 else 0
+        scores.append(item_score)
+        if return_per_item:
+            per_item.append({"claims_nli": 100 * item_score})
+    agg = 100 * np.mean(scores) if len(scores) > 0 else 0
+    if return_per_item:
+        return agg, per_item
+    return agg
 
 
 def compute_autoais(data,
                     decontext=False,
                     concat=False,
                     qampari=False,
-                    at_most_citations=None,):
+                    at_most_citations=None,
+                    return_per_item=False,):
     """
     Compute AutoAIS score.
 
@@ -332,19 +391,24 @@ def compute_autoais(data,
 
     ais_scores = []
     ais_scores_prec = []
+    per_item_citation_rec = [0.0 for _ in range(len(data))]
+    per_item_citation_prec = [0.0 for _ in range(len(data))]
 
     sent_total = 0
     sent_mcite = 0
     sent_mcite_support = 0
     sent_mcite_overcite = 0
     autoais_log = []
-    for item in tqdm(data):
+    for item_idx, item in enumerate(tqdm(data)):
         # Get sentences by using NLTK
         if qampari:
             sents = [item['question'] + " " + x.strip() for x in item['output'].rstrip().rstrip(".").rstrip(",").split(",")]
         else:
             sents = sent_tokenize(item['output'])
         if len(sents) == 0:
+            # Keep aggregate behavior (skip empty outputs) but still emit a per-item placeholder.
+            per_item_citation_rec[item_idx] = 0.0
+            per_item_citation_prec[item_idx] = 0.0
             continue
 
         target_sents = [remove_citations(sent).strip() for sent in sents]
@@ -413,8 +477,12 @@ def compute_autoais(data,
                 entail_prec += joint_entail 
 
         sent_total += len(sents)
-        ais_scores.append(entail / len(sents))
-        ais_scores_prec.append(entail_prec / total_citations if total_citations > 0 else 0) # len(sents))
+        item_citation_rec = entail / len(sents)
+        item_citation_prec = entail_prec / total_citations if total_citations > 0 else 0
+        ais_scores.append(item_citation_rec)
+        ais_scores_prec.append(item_citation_prec) # len(sents))
+        per_item_citation_rec[item_idx] = 100 * item_citation_rec
+        per_item_citation_prec[item_idx] = 100 * item_citation_prec
 
     if sent_mcite > 0 and sent_mcite_support > 0:
         print("Among all sentences, %.2f%% have multiple citations, among which %.2f%% are supported by the joint set, among which %.2f%% overcite." % (
@@ -423,10 +491,17 @@ def compute_autoais(data,
             100 * sent_mcite_overcite / sent_mcite_support
         ))
 
-    return {
+    agg = {
         "citation_rec": 100 * np.mean(ais_scores),
         "citation_prec": 100 * np.mean(ais_scores_prec),
     }
+    if return_per_item:
+        per_item = [
+            {"citation_rec": per_item_citation_rec[i], "citation_prec": per_item_citation_prec[i]}
+            for i in range(len(data))
+        ]
+        return agg, per_item
+    return agg
 
 
 def compute_qampari_f1(data, cot=False):
@@ -472,6 +547,87 @@ def compute_qampari_f1(data, cot=False):
         "qampari_f1_top5": 100 * np.mean(f1_top5),
     }
 
+
+def compute_qampari_f1_per_item(data, cot=False):
+    """Compute per-item QAMPARI precision/recall/F1 (0-100) and num_preds."""
+    per_item = []
+    for item in data:
+        if cot:
+            if ":" in item.get("output", ""):
+                o = ':'.join(item["output"].split(":")[1:])
+            else:
+                o = ""
+        else:
+            o = item.get("output", "")
+
+        preds = [normalize_answer(x.strip()) for x in o.rstrip().rstrip(".").rstrip(",").split(",")]
+        preds = [p for p in preds if len(p) > 0]
+        answers = [[normalize_answer(x) for x in ans] for ans in item.get("answers", [])]
+        flat_answers = [x for sublist in answers for x in sublist]
+
+        p = sum([pred in flat_answers for pred in preds]) / len(preds) if len(preds) > 0 else 0
+        r = sum([any([x in preds for x in a]) for a in answers]) / len(answers) if len(answers) > 0 else 0
+        r_top5 = (
+            min(5, sum([any([x in preds for x in a]) for a in answers])) / min(5, len(answers))
+            if len(answers) > 0
+            else 0
+        )
+        f1 = 0 if (p + r) == 0 else 2 * p * r / (p + r)
+        f1_top5 = 0 if (p + r_top5) == 0 else 2 * p * r_top5 / (p + r_top5)
+
+        per_item.append(
+            {
+                "num_preds": float(len(preds)),
+                "qampari_prec": 100 * p,
+                "qampari_rec": 100 * r,
+                "qampari_rec_top5": 100 * r_top5,
+                "qampari_f1": 100 * f1,
+                "qampari_f1_top5": 100 * f1_top5,
+            }
+        )
+    return per_item
+
+
+def compute_len_per_item(data):
+    """Compute per-item output length in words."""
+    return [float(len(item.get("output", "").split())) for item in data]
+
+
+def _resolve_correctness_metric(args, qampari, normalized_data):
+    """
+    Resolve correctness metric name based on args + dataset, aligned with README recipes.
+    Returns one of the explicit metric identifiers accepted by `--correctness_metric`.
+    """
+    if args.correctness_metric != "auto":
+        return args.correctness_metric
+
+    if qampari:
+        return "qampari_f1"
+
+    has_qa_pairs = any(("qa_pairs" in item and item["qa_pairs"] is not None) for item in normalized_data)
+    if has_qa_pairs:
+        return "asqa_qa_f1" if args.qa else "asqa_str_em"
+
+    if args.claims_nli:
+        return "eli5_claims_nli"
+
+    return "rougeLsum"
+
+
+def _get_candidate_tag(args):
+    if getattr(args, "candidate_tag", None):
+        return args.candidate_tag
+    return os.path.splitext(os.path.basename(args.f))[0]
+
+
+def _get_item_id(item, fallback):
+    """Prefer stable item identifiers when available."""
+    if isinstance(item, dict):
+        for key in ("id", "sample_id"):
+            if key in item and item[key] is not None:
+                return item[key]
+    return fallback
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--f", type=str, required=True, help="Output file. Should have field `question`, `output`, (ROUGE) `answer`, \
@@ -486,7 +642,54 @@ def main():
     # QAMPARI
     parser.add_argument("--cot", action="store_true", help="For QAMPARI, try to find colon and separate the COT and answer listing")
 
+    # Per-sample export (for DPO scoring)
+    parser.add_argument(
+        "--export_scored_candidates",
+        type=str,
+        nargs="?",
+        const="__AUTO__",
+        default=None,
+        help="Export per-sample scores as JSONL. If provided without a path, defaults to `<f>.scored_candidates.jsonl`.",
+    )
+    parser.add_argument(
+        "--candidate_tag",
+        type=str,
+        default=None,
+        help="Optional constant tag written into each JSONL row. Defaults to result filename basename.",
+    )
+    parser.add_argument(
+        "--correctness_metric",
+        type=str,
+        default="auto",
+        choices=[
+            "auto",
+            "qampari_f1",
+            "qampari_f1_top5",
+            "asqa_str_em",
+            "asqa_qa_f1",
+            "eli5_claims_nli",
+            "rougeLsum",
+        ],
+        help="Per-sample correctness metric to export (default: auto, aligned with README recipes).",
+    )
+    parser.add_argument(
+        "--export_extra_metrics",
+        action="store_true",
+        help="If set, export extra per-sample metrics (when available/enabled) in addition to the required fields.",
+    )
+
     args = parser.parse_args()
+
+    export_requested = args.export_scored_candidates is not None
+    export_path = None
+    if export_requested:
+        export_path = args.export_scored_candidates
+        if export_path == "__AUTO__":
+            export_path = args.f + ".scored_candidates.jsonl"
+        if not args.citations:
+            raise ValueError("--export_scored_candidates requires --citations to compute per-sample citation scores.")
+    elif args.export_extra_metrics:
+        raise ValueError("--export_extra_metrics requires --export_scored_candidates.")
 
     with open(args.f) as f:
         data_with_config = json.load(f)
@@ -517,18 +720,128 @@ def main():
     result = {}
     result['length'] = compute_len(normalized_data)
     result['str_em'], result['str_hit'] = compute_str_em(normalized_data)
+
+    # Optional per-item metric holders (aligned by index into `data` / `normalized_data`)
+    per_item_str = None
+    per_item_qampari = None
+    per_item_rouge = None
+    per_item_qa = None
+    per_item_claims = None
+    per_item_citations = None
+    per_item_length = None
+
+    if export_requested:
+        per_item_str = compute_str_em_per_item(normalized_data)
+        per_item_length = compute_len_per_item(normalized_data)
+
     if qampari:
         result.update(compute_qampari_f1(normalized_data, cot=args.cot))
+        if export_requested:
+            per_item_qampari = compute_qampari_f1_per_item(normalized_data, cot=args.cot)
     if not args.no_rouge:
         result['rougeLsum'] = compute_rouge(normalized_data)
     if args.qa:
-        result.update(compute_qa(normalized_data))
+        qa_ret = compute_qa(normalized_data, return_per_item=export_requested)
+        if isinstance(qa_ret, tuple):
+            qa_agg, per_item_qa = qa_ret
+            result.update(qa_agg)
+        else:
+            result.update(qa_ret)
     if args.mauve:
         result['mauve'] = compute_mauve(normalized_data)
     if args.citations: 
-        result.update(compute_autoais(data, qampari=qampari, at_most_citations=args.at_most_citations))
+        autoais_ret = compute_autoais(
+            data,
+            qampari=qampari,
+            at_most_citations=args.at_most_citations,
+            return_per_item=export_requested,
+        )
+        if isinstance(autoais_ret, tuple):
+            autoais_agg, per_item_citations = autoais_ret
+            result.update(autoais_agg)
+        else:
+            result.update(autoais_ret)
     if args.claims_nli:
-        result["claims_nli"] = compute_claims(normalized_data)
+        claims_ret = compute_claims(
+            normalized_data,
+            return_per_item=export_requested,
+        )
+        if isinstance(claims_ret, tuple):
+            claims_agg, per_item_claims = claims_ret
+            result["claims_nli"] = claims_agg
+        else:
+            result["claims_nli"] = claims_ret
+
+    if export_requested:
+        candidate_tag = _get_candidate_tag(args)
+        correctness_metric = _resolve_correctness_metric(args, qampari=qampari, normalized_data=normalized_data)
+
+        # Resolve per-item correctness values
+        correctness = [0.0 for _ in range(len(normalized_data))]
+        if correctness_metric == "qampari_f1":
+            if not qampari or per_item_qampari is None:
+                raise ValueError("correctness_metric=qampari_f1 requires a QAMPARI result file.")
+            correctness = [x["qampari_f1"] for x in per_item_qampari]
+        elif correctness_metric == "qampari_f1_top5":
+            if not qampari or per_item_qampari is None:
+                raise ValueError("correctness_metric=qampari_f1_top5 requires a QAMPARI result file.")
+            correctness = [x["qampari_f1_top5"] for x in per_item_qampari]
+        elif correctness_metric == "asqa_str_em":
+            if per_item_str is None:
+                per_item_str = compute_str_em_per_item(normalized_data)
+            correctness = [x["str_em"] for x in per_item_str]
+        elif correctness_metric == "asqa_qa_f1":
+            if not args.qa:
+                raise ValueError("correctness_metric=asqa_qa_f1 requires --qa.")
+            if per_item_qa is None:
+                qa_agg, per_item_qa = compute_qa(normalized_data, return_per_item=True)
+                result.update(qa_agg)
+            correctness = [x["QA-F1"] for x in per_item_qa]
+        elif correctness_metric == "eli5_claims_nli":
+            if not args.claims_nli:
+                raise ValueError("correctness_metric=eli5_claims_nli requires --claims_nli.")
+            if per_item_claims is None:
+                claims_agg, per_item_claims = compute_claims(normalized_data, return_per_item=True)
+                result["claims_nli"] = claims_agg
+            correctness = [x["claims_nli"] for x in per_item_claims]
+        elif correctness_metric == "rougeLsum":
+            if per_item_rouge is None:
+                per_item_rouge = compute_rouge_per_item(normalized_data)
+            correctness = per_item_rouge
+        else:
+            raise ValueError(f"Unknown correctness_metric: {correctness_metric}")
+
+        if per_item_citations is None:
+            raise RuntimeError("Per-item citations were not computed; ensure --citations is set.")
+
+        with open(export_path, "w", encoding="utf-8") as wf:
+            for idx, item in enumerate(data):
+                row = {
+                    "id": _get_item_id(item, idx),
+                    "candidate_tag": candidate_tag,
+                    "citation_rec": per_item_citations[idx]["citation_rec"],
+                    "citation_prec": per_item_citations[idx]["citation_prec"],
+                    "correctness": correctness[idx],
+                }
+
+                if args.export_extra_metrics:
+                    if per_item_length is None:
+                        per_item_length = compute_len_per_item(normalized_data)
+                    row["length"] = per_item_length[idx]
+                    if per_item_str is not None:
+                        row.update(per_item_str[idx])
+                    if per_item_rouge is None:
+                        per_item_rouge = compute_rouge_per_item(normalized_data)
+                    if per_item_rouge is not None:
+                        row["rougeLsum"] = per_item_rouge[idx]
+                    if per_item_qampari is not None:
+                        row.update(per_item_qampari[idx])
+                    if per_item_qa is not None:
+                        row.update(per_item_qa[idx])
+                    if per_item_claims is not None:
+                        row.update(per_item_claims[idx])
+
+                wf.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     print(result)
     with open(args.f + ".score", "w") as f:
