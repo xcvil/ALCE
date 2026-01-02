@@ -23,6 +23,7 @@ from transformers import (
     AutoTokenizer,
     pipeline
 )
+from datasets import Dataset
 
 from utils import normalize_answer, get_max_memory, remove_citations
 
@@ -249,26 +250,56 @@ def compute_qa(data, return_per_item=False):
 
     # Load model
     logger.info("Loading the RoBERTa-large SQuAD model for QA-based accuracy...")
-    qa_pipeline = pipeline("question-answering", model=QA_MODEL, device=0)
+    qa_pipeline = pipeline("question-answering", model=QA_MODEL, device=0, batch_size=8)
     logger.info("Done")
 
-    # Get prediction
+    # Collect all QA inputs for batched processing
     logger.info("Computing the QA-based accuracy...")
+    all_inputs = []
+    item_indices = []  # Track which item each input belongs to
+    qa_pair_indices = []  # Track which qa_pair within the item
+
+    for item_idx, item in enumerate(data):
+        context = item['output'] if len(item['output']) > 0 else " "
+        for qa_idx, qa_pair in enumerate(item['qa_pairs']):
+            all_inputs.append({
+                "question": qa_pair['question'],
+                "context": context
+            })
+            item_indices.append(item_idx)
+            qa_pair_indices.append(qa_idx)
+
+    # Run batched inference using Dataset for efficiency
+    if len(all_inputs) > 0:
+        dataset = Dataset.from_list(all_inputs)
+        all_results = []
+        for out in tqdm(qa_pipeline(dataset, handle_impossible_answer=True), total=len(all_inputs)):
+            all_results.append(out)
+    else:
+        all_results = []
+
+    # Aggregate results back to per-item metrics
     em, f1, bins = [], [], []
     per_item = []
-    for item in tqdm(data):
-        question = [qa_pair['question'] for qa_pair in item['qa_pairs']]
-        context = item['output'] if len(item['output']) > 0 else " "
-        results = qa_pipeline(question=question, context=context, handle_impossible_answer=True)
-        loc_counter, loc_em, loc_f1 = 0, 0, 0
 
-        for idx, res in enumerate(results):
-            answers = item["qa_pairs"][idx]["short_answers"]
-            prediction = res["answer"]
+    # Initialize per-item accumulators
+    item_stats = {i: {"loc_em": 0, "loc_f1": 0, "loc_counter": 0} for i in range(len(data))}
 
-            loc_em += max([compute_exact(a, prediction) for a in answers])
-            loc_f1 += max([compute_f1(a, prediction) for a in answers])
-            loc_counter += 1
+    for result_idx, res in enumerate(all_results):
+        item_idx = item_indices[result_idx]
+        qa_idx = qa_pair_indices[result_idx]
+        answers = data[item_idx]["qa_pairs"][qa_idx]["short_answers"]
+        prediction = res["answer"]
+
+        item_stats[item_idx]["loc_em"] += max([compute_exact(a, prediction) for a in answers])
+        item_stats[item_idx]["loc_f1"] += max([compute_f1(a, prediction) for a in answers])
+        item_stats[item_idx]["loc_counter"] += 1
+
+    for item_idx in range(len(data)):
+        stats = item_stats[item_idx]
+        loc_counter = stats["loc_counter"]
+        loc_em = stats["loc_em"]
+        loc_f1 = stats["loc_f1"]
 
         item_em = loc_em / loc_counter if loc_counter > 0 else 0
         item_f1 = loc_f1 / loc_counter if loc_counter > 0 else 0
@@ -334,7 +365,7 @@ def compute_claims(data, return_per_item=False):
     global autoais_model, autoais_tokenizer
     if autoais_model is None:
         logger.info("Loading AutoAIS model...")
-        autoais_model = AutoModelForSeq2SeqLM.from_pretrained(AUTOAIS_MODEL, torch_dtype=torch.bfloat16, max_memory=get_max_memory(), device_map="auto")
+        autoais_model = AutoModelForSeq2SeqLM.from_pretrained(AUTOAIS_MODEL, dtype=torch.bfloat16, max_memory=get_max_memory(), device_map="auto")
         autoais_tokenizer = AutoTokenizer.from_pretrained(AUTOAIS_MODEL, use_fast=False)
 
     logger.info("Computing claims...")
@@ -375,7 +406,7 @@ def compute_autoais(data,
     global autoais_model, autoais_tokenizer
     if autoais_model is None:
         logger.info("Loading AutoAIS model...")
-        autoais_model = AutoModelForSeq2SeqLM.from_pretrained(AUTOAIS_MODEL, torch_dtype=torch.bfloat16, max_memory=get_max_memory(), device_map="auto")
+        autoais_model = AutoModelForSeq2SeqLM.from_pretrained(AUTOAIS_MODEL, dtype=torch.bfloat16, max_memory=get_max_memory(), device_map="auto")
         autoais_tokenizer = AutoTokenizer.from_pretrained(AUTOAIS_MODEL, use_fast=False)
 
     logger.info(f"Running AutoAIS...")
