@@ -228,16 +228,8 @@ class LLM:
                     # Hard rules for model parameter support:
                     # - Some model families (e.g., gpt-5 / o1 / o3) use `max_completion_tokens` (not `max_tokens`)
                     # - Some model families reject decoding knobs like `temperature` / `top_p`
-                    uses_max_completion_tokens = (
-                        model_id.startswith("gpt-5")
-                        or model_id.startswith("o1")
-                        or model_id.startswith("o3")
-                    )
-                    supports_temperature = not (
-                        model_id.startswith("gpt-5")
-                        or model_id.startswith("o1")
-                        or model_id.startswith("o3")
-                    )
+                    uses_max_completion_tokens = True
+                    supports_temperature = False
 
                     request_kwargs = {
                         "model": self.model,
