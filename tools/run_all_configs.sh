@@ -9,7 +9,7 @@ set -euo pipefail
 #   bash tools/run_all_configs.sh configs/new
 #   bash tools/run_all_configs.sh configs/new -- --quick_test 10
 
-CONFIG_DIR="${1:-configs/new}"
+CONFIG_DIR="${1:-configs/asqa}"
 shift || true
 
 # If user provided `--`, drop it and forward the rest to run.py
