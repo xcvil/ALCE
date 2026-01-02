@@ -162,3 +162,10 @@ cython_debug/
 data/
 result
 *.tar
+
+# Local experiment artifacts (do not commit)
+result_*/
+dpo_train*.jsonl
+*.scored_candidates.jsonl
+*.score
+logs/
